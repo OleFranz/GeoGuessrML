@@ -1,0 +1,9 @@
+# Ignore the dataset
+/dataset
+/dataset-cache
+
+# Ignore the TensorBoard logs
+/logs
+
+# Ignore the trained models
+/models
