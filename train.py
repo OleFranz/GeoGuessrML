@@ -5,6 +5,7 @@ import os
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import Dataset, DataLoader
 import torch.optim.lr_scheduler as lr_scheduler
 from torch.amp import GradScaler, autocast
 from torchvision import transforms
@@ -18,10 +19,8 @@ import random
 import shutil
 import torch
 import copy
-import math
 import time
 import cv2
-import gc
 
 Path = os.path.dirname(__file__).replace("\\", "/")
 ModelPath = f"{Path}/models"
@@ -222,109 +221,84 @@ def main():
         transforms.ToTensor()
     ])
 
-    global DataLoaderConfig; DataLoaderConfig = {}
-    global DataLoaderCache; DataLoaderCache = {}
+    class CustomDataset(Dataset):
+        def __init__(Self, Files, Transform, Shuffle, BatchSize, BatchPreloadCount):
+            Self.Cache = {}
+            Self.LastUsedIndex = None
+            Self.UseFiles = []
+            Self.Files = Files
+            Self.Transform = Transform
+            Self.Shuffle = Shuffle
+            Self.BatchSize = BatchSize
+            Self.BatchPreloadCount = BatchPreloadCount
 
-    def InitializeDataLoader(DataLoaderName:str, Transform:transforms.Compose, Files:list, BatchSize:int, Shuffle:bool, DropLast:bool, BatchPreloadCount:int):
-        DataLoaderConfig[DataLoaderName] = {
-            "Files": Files,
-            "Transform": Transform,
-            "BatchSize": BatchSize,
-            "Shuffle": Shuffle,
-            "DropLast": DropLast,
-            "BatchPreloadCount": BatchPreloadCount
-        }
+        def __len__(Self):
+            return len(Self.Files)
 
-    def CacheBatch(DataLoaderName:str, Index:int):
-        global DataLoaderConfig, DataLoaderCache
-        if Index == 0:
-            DataLoaderCache = {}
-        if Index >= GetBatchCount(DataLoaderName):
-            return
-        if DataLoaderName + str(Index) not in DataLoaderCache:
-            DataLoaderCache[DataLoaderName + str(Index)] = {}
-            DataLoaderCache[DataLoaderName + str(Index)]["FullyCached"] = False
-        threading.Thread(target=CacheBatchThread, args=(DataLoaderName, Index), daemon=True).start()
+        def CacheIndex(Self, Index):
+            if Index == 0:
+                Self.Cache = {}
+                Self.LastUsedIndex = None
+            if str(Index) not in Self.Cache:
+                Self.Cache[str(Index)] = {}
+                Self.Cache[str(Index)]["FullyCached"] = False
+            threading.Thread(target=Self.CacheIndexThread, args=(Index,), daemon=True).start()
 
-    def CacheBatchThread(DataLoaderName:str, Index:int):
-        global DataLoaderConfig, DataLoaderCache
-        if Index == 0:
-            if DataLoaderConfig[DataLoaderName]["Shuffle"]:
-                DataLoaderConfig[DataLoaderName]["USE-Files"] = random.sample(DataLoaderConfig[DataLoaderName]["Files"], len(DataLoaderConfig[DataLoaderName]["Files"]))
-            else:
-                DataLoaderConfig[DataLoaderName]["USE-Files"] = DataLoaderConfig[DataLoaderName]["Files"]
+        def CacheIndexThread(Self, Index):
+            if Index == 0:
+                if Self.Shuffle:
+                    Self.UseFiles = random.sample(Self.Files, len(Self.Files))
+                else:
+                    Self.UseFiles = Self.Files
 
-        FileCount = len(DataLoaderConfig[DataLoaderName]["USE-Files"])
-        Start = min(max(0, Index * DataLoaderConfig[DataLoaderName]["BatchSize"]), FileCount)
-        End = min(max(0, (Index + 1) * DataLoaderConfig[DataLoaderName]["BatchSize"]), FileCount)
+            File = Self.UseFiles[Index]
 
-        Files = DataLoaderConfig[DataLoaderName]["USE-Files"][Start: End]
-        Images = []
-        Labels = []
-
-        for File in Files:
             Img = Image.open(File).convert("RGB")
             Img = np.array(Img)
             Img = cv2.resize(Img, (ImageWidth, ImageHeight))
             Img = Img / 255.0
+            Img = Self.Transform(Img)
+            Img = torch.as_tensor(Img, dtype=torch.float32)
 
             Class = Classes[os.path.basename(os.path.dirname(File))]
             Label = [0] * ClassCount
             Label[int(Class)] = 1
+            Label = torch.as_tensor(Label, dtype=torch.float32)
 
-            Images.append(DataLoaderConfig[DataLoaderName]["Transform"](Img))
-            Labels.append(torch.as_tensor(Label, dtype=torch.float32))
+            Self.Cache[str(Index)]["Image"] = Img
+            Self.Cache[str(Index)]["Label"] = Label
+            Self.Cache[str(Index)]["FullyCached"] = True
 
-        DataLoaderCache[DataLoaderName + str(Index)]["Images"] = torch.as_tensor(torch.stack(Images), dtype=torch.float32)
-        DataLoaderCache[DataLoaderName + str(Index)]["Labels"] = torch.stack(Labels)
-        DataLoaderCache[DataLoaderName + str(Index)]["FullyCached"] = True
+        def ClearIndex(Self, Index):
+            if str(Index) in Self.Cache:
+                del Self.Cache[str(Index)]
 
-    def ClearBatch(DataLoaderName:str, Index:int):
-        if DataLoaderName + str(Index) in DataLoaderCache:
-            del DataLoaderCache[DataLoaderName + str(Index)]
+        def GetIndex(Self, Index):
+            if str(Index) not in Self.Cache:
+                Self.CacheIndex(Index)
+                for i in range(Self.BatchPreloadCount * Self.BatchSize):
+                    Self.CacheIndex(Index + 1 + i)
+            Self.CacheIndex(Index + Self.BatchPreloadCount * Self.BatchSize)
+            if Self.LastUsedIndex != None:
+                Self.ClearIndex(Self.LastUsedIndex)
+            while Self.Cache[str(Index)]["FullyCached"] == False:
+                time.sleep(0.0001)
+            Self.LastUsedIndex = Index
+            return Self.Cache[str(Index)]["Image"], Self.Cache[str(Index)]["Label"]
 
-    def GetBatch(DataLoaderName:str, Index:int):
-        global DataLoaderConfig, DataLoaderCache
-        if DataLoaderName + str(Index) not in DataLoaderCache:
-            CacheBatch(DataLoaderName, Index)
-            for i in range(DataLoaderConfig[DataLoaderName]["BatchPreloadCount"]):
-                CacheBatch(DataLoaderName, Index + 1 + i)
-        CacheBatch(DataLoaderName, Index + DataLoaderConfig[DataLoaderName]["BatchPreloadCount"])
-        if "LastUsedIndex" in DataLoaderConfig[DataLoaderName]:
-            ClearBatch(DataLoaderName, DataLoaderConfig[DataLoaderName]["LastUsedIndex"])
-        while DataLoaderCache[DataLoaderName + str(Index)]["FullyCached"] == False:
-            time.sleep(0.0001)
-        DataLoaderConfig[DataLoaderName]["LastUsedIndex"] = Index
-        return DataLoaderCache[DataLoaderName + str(Index)]["Images"], DataLoaderCache[DataLoaderName + str(Index)]["Labels"]
+        def __getitem__(Self, Index):
+            return Self.GetIndex(Index)
 
-    def GetBatchCount(DataLoaderName:str):
-        global DataLoaderConfig, DataLoaderCache
-        FileCount = len(DataLoaderConfig[DataLoaderName]["Files"])
-        if DataLoaderConfig[DataLoaderName]["DropLast"]:
-            return math.floor(FileCount / DataLoaderConfig[DataLoaderName]["BatchSize"])
-        else:
-            return math.ceil(FileCount / DataLoaderConfig[DataLoaderName]["BatchSize"])
+    TrainingDataset = CustomDataset(TrainingFiles, TrainingTransform, Shuffle, BatchSize, 2)
+    ValidationDataset = CustomDataset(ValidationFiles, ValidationTransform, Shuffle, BatchSize, 2)
 
-    InitializeDataLoader(DataLoaderName="Training",
-                         Transform=TrainingTransform,
-                         Files=TrainingFiles,
-                         BatchSize=BatchSize,
-                         Shuffle=Shuffle,
-                         DropLast=DropLast,
-                         BatchPreloadCount=10)
-
-    InitializeDataLoader(DataLoaderName="Validation",
-                         Transform=ValidationTransform,
-                         Files=ValidationFiles,
-                         BatchSize=BatchSize,
-                         Shuffle=Shuffle,
-                         DropLast=DropLast,
-                         BatchPreloadCount=10)
+    TrainingDataloader = DataLoader(TrainingDataset, batch_size=BatchSize, shuffle=False, num_workers=0, pin_memory=False, drop_last=DropLast)
+    ValidationDataloader = DataLoader(ValidationDataset, batch_size=BatchSize, shuffle=False, num_workers=0, pin_memory=False, drop_last=DropLast)
 
     Scaler = GradScaler(device=str(Device))
     Criterion = nn.CrossEntropyLoss()
     Optimizer = optim.Adam(Model.parameters(), lr=LearningRate)
-    Scheduler = lr_scheduler.OneCycleLR(Optimizer, max_lr=MaxLearningRate, steps_per_epoch=GetBatchCount("Training"), epochs=Epochs)
+    Scheduler = lr_scheduler.OneCycleLR(Optimizer, max_lr=MaxLearningRate, steps_per_epoch=len(TrainingDataloader), epochs=Epochs)
 
     BestValidationLoss = float("inf")
     BestModel = None
@@ -385,9 +359,7 @@ def main():
 
         Model.train()
         RunningTrainingLoss = 0.0
-        for i in range(GetBatchCount("Training")):
-            Data = GetBatch("Training", i)
-            Images, Labels = Data
+        for i, (Images, Labels) in enumerate(TrainingDataloader, 0):
             Images = Images.to(Device, non_blocking=True)
             Labels = Labels.to(Device, non_blocking=True)
             Optimizer.zero_grad()
@@ -398,9 +370,8 @@ def main():
             Scaler.step(Optimizer)
             Scaler.update()
             Scheduler.step()
-            gc.collect()
             RunningTrainingLoss += Loss.item()
-        RunningTrainingLoss /= GetBatchCount("Training")
+        RunningTrainingLoss /= len(TrainingDataloader)
         TrainingLoss = RunningTrainingLoss
 
         EpochTrainingTime = time.time() - EpochTrainingStartTime
@@ -411,15 +382,13 @@ def main():
         Model.eval()
         RunningValidationLoss = 0.0
         with torch.no_grad(), autocast(device_type=str(Device)):
-            for i in range(GetBatchCount("Validation")):
-                Data = GetBatch("Validation", i)
-                Images, Labels = Data
+            for i, (Images, Labels) in enumerate(ValidationDataloader, 0):
                 Images = Images.to(Device, non_blocking=True)
                 Labels = Labels.to(Device, non_blocking=True)
                 Outputs = Model(Images)
                 Loss = Criterion(Outputs, Labels)
                 RunningValidationLoss += Loss.item()
-        RunningValidationLoss /= GetBatchCount("Validation")
+        RunningValidationLoss /= len(ValidationDataloader)
         ValidationLoss = RunningValidationLoss
 
         EpochValidationTime = time.time() - EpochValidationStartTime
