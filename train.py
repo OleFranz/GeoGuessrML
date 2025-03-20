@@ -410,7 +410,30 @@ def main():
             if Progress < 0: Progress = 0
             Progress = "█" * round(Progress * 10) + "░" * (10 - round(Progress * 10))
             EpochTime = round(EpochTotalTime, 2) if EpochTotalTime > 1 else round((EpochTotalTime) * 1000)
-            ETA = time.strftime("%H:%M:%S", time.gmtime(round((TrainingTimePrediction - TrainingStartTime) / (TrainingEpoch) * Epochs - (TrainingTimePrediction - TrainingStartTime) + (TrainingTimePrediction - time.perf_counter()), 2)))
+            ETA = round((TrainingTimePrediction - TrainingStartTime) / (TrainingEpoch) * Epochs - (TrainingTimePrediction - TrainingStartTime) + (TrainingTimePrediction - time.perf_counter()))
+            MINUTE, HOUR, DAY, MONTH, YEAR = 60, 60*60, 24*60*60, 30*24*60*60, 365*24*60*60
+            if ETA < MINUTE:
+                ETA = f"{ETA:02d}s"
+            elif ETA < HOUR:
+                ETA = f"{ETA//MINUTE:02d}:{ETA%MINUTE:02d}"
+            elif ETA < DAY:
+                h, r = divmod(ETA, HOUR)
+                ETA = f"{h:02d}:{r//MINUTE:02d}:{r%MINUTE:02d}"
+            elif ETA < MONTH:
+                d, r = divmod(ETA, DAY)
+                h, r = divmod(r, HOUR)
+                ETA = f"{d:02d}:{h:02d}:{r//MINUTE:02d}:{r%MINUTE:02d}"
+            elif ETA < YEAR:
+                mo, r = divmod(ETA, MONTH)
+                d, r = divmod(r, DAY)
+                h, r = divmod(r, HOUR)
+                ETA = f"{mo:02d}:{d:02d}:{h:02d}:{r//MINUTE:02d}:{r%MINUTE:02d}"
+            else:
+                y, r = divmod(ETA, YEAR)
+                mo, r = divmod(r, MONTH)
+                d, r = divmod(r, DAY)
+                h, r = divmod(r, HOUR)
+                ETA = f"{y:02d}:{mo:02d}:{d:02d}:{h:02d}:{r//MINUTE:02d}:{r%MINUTE:02d}"
             Message = f"{Progress} Epoch {TrainingEpoch}, Train Loss: {NumToStr(TrainingLoss)}, Val Loss: {NumToStr(ValidationLoss)}, {EpochTime}{'s' if EpochTotalTime > 1 else 'ms'}/Epoch, ETA: {ETA}"
             print(f"\r{Message}" + (" " * (len(LastMessage) - len(Message)) if len(LastMessage) > len(Message) else ""), end="", flush=True)
             LastMessage = Message
