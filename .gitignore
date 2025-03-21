@@ -1,3 +1,6 @@
+# ignore the pycache everywhere
+**/__pycache__
+
 # Ignore the dataset
 /dataset
 /dataset-cache
@@ -7,3 +10,6 @@
 
 # Ignore the trained models
 /models
+
+# Ignore the checkpoints
+/checkpoints
