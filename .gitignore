@@ -2,14 +2,14 @@
 **/__pycache__
 
 # Ignore the dataset
-/dataset
-/dataset-cache
+/train/dataset
+/train/dataset-cache
 
 # Ignore the TensorBoard logs
-/logs
+/train/logs
 
 # Ignore the trained models
-/models
+/train/models
 
 # Ignore the checkpoints
-/checkpoints
+/train/checkpoints
