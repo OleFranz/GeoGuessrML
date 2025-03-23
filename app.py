@@ -156,6 +156,7 @@ while True:
     if SimpleWindow.GetOpen(WindowName) != True:
         break
 
+
     ImageUI.Input(X1=5,
                   Y1=5,
                   X2=Right - 5,
@@ -173,7 +174,6 @@ while True:
                     Placeholder="Insert the path to the image here!",
                     OnChange=lambda Path: threading.Thread(target=LoadImage, args=(Path,), daemon=True).start())
 
-
     if ModelLoaded and ImageLoaded and LastTimeAbleToGuess == False:
         LastTimeAbleToGuess = True
         ImageUI.Popup(Text="Guessing location...",
@@ -189,7 +189,6 @@ while True:
                       ShowDuration=1)
         threading.Thread(target=Guess, daemon=True).start()
 
-
     if Results != []:
         for i, (ClassName, Score) in enumerate(Results):
             ImageUI.Button(Text=f"{ClassName}: {round(Score, 3)}%",
@@ -198,8 +197,6 @@ while True:
                            X2=200,
                            Y2=125 + 35 * i,
                            ID=f"Button{i}")
-                           
-
 
     ImageUI.Image(Image=OriginalImage,
                   X1=0,
