@@ -8,7 +8,6 @@ Path = os.path.dirname(__file__).replace("\\", "/")
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import Dataset, DataLoader
 import torch.optim.lr_scheduler as lr_scheduler
-from torch.amp import GradScaler, autocast
 from torchvision import transforms
 import torch.optim as optim
 import multiprocessing
@@ -33,13 +32,10 @@ ImageHeight = 360
 ColorChannels = 3
 LearningRate = 0.001
 MaxLearningRate = 0.001
-NumWorkers = 0
 Dropout = 0.1
 Patience = 100
 Shuffle = True
 DropLast = True
-PinMemory = True
-CustomDataLoader = False
 
 ImagesPerClass = -1
 DataPath = f"{Path}/dataset/hub"
@@ -109,7 +105,6 @@ print(Timestamp() + "> Image height:", ImageHeight)
 print(Timestamp() + "> Color channels:", ColorChannels)
 print(Timestamp() + "> Learning rate:", LearningRate)
 print(Timestamp() + "> Max learning rate:", MaxLearningRate)
-print(Timestamp() + "> Number of workers:", NumWorkers)
 print(Timestamp() + "> Dropout:", Dropout)
 print(Timestamp() + "> Patience:", Patience)
 print(Timestamp() + "> Shuffle:", Shuffle)
@@ -188,7 +183,7 @@ class NeuralNetwork(nn.Module):
         return X
 
 def main():
-    Model = NeuralNetwork().to(Device)
+    Model = NeuralNetwork().to(Device).to(torch.bfloat16)
 
     TotalParameters = 0
     for Parameter in Model.parameters():
@@ -232,111 +227,82 @@ def main():
         transforms.ToTensor()
     ])
 
-    if CustomDataLoader:
-        class CustomDataset(Dataset):
-            def __init__(Self, Files, Transform, Shuffle, BatchSize, BatchPreloadCount):
+    class CustomDataset(Dataset):
+        def __init__(Self, Files:list, Transform:transforms.Compose, Device:torch.device, DType:torch.dtype, Shuffle:bool, BatchSize:int, BatchPreloadCount:int):
+            Self.Cache = {}
+            Self.LastUsedIndex = None
+            Self.UseFiles = []
+            Self.Files = Files
+            Self.Transform = Transform
+            Self.Device = Device
+            Self.DType = DType
+            Self.Shuffle = Shuffle
+            Self.BatchSize = BatchSize
+            Self.BatchPreloadCount = BatchPreloadCount
+
+        def __len__(Self):
+            return len(Self.Files)
+
+        def CacheIndex(Self, Index):
+            if Index == 0:
                 Self.Cache = {}
                 Self.LastUsedIndex = None
-                Self.UseFiles = []
-                Self.Files = Files
-                Self.Transform = Transform
-                Self.Shuffle = Shuffle
-                Self.BatchSize = BatchSize
-                Self.BatchPreloadCount = BatchPreloadCount
+            if str(Index) not in Self.Cache:
+                Self.Cache[str(Index)] = {}
+                Self.Cache[str(Index)]["FullyCached"] = False
+            threading.Thread(target=Self.CacheIndexThread, args=(Index,), daemon=True).start()
 
-            def __len__(Self):
-                return len(Self.Files)
+        def CacheIndexThread(Self, Index):
+            if Index == 0:
+                if Self.Shuffle:
+                    Self.UseFiles = random.sample(Self.Files, len(Self.Files))
+                else:
+                    Self.UseFiles = Self.Files
+            elif Index >= len(Self.UseFiles):
+                return
 
-            def CacheIndex(Self, Index):
-                if Index == 0:
-                    Self.Cache = {}
-                    Self.LastUsedIndex = None
-                if str(Index) not in Self.Cache:
-                    Self.Cache[str(Index)] = {}
-                    Self.Cache[str(Index)]["FullyCached"] = False
-                threading.Thread(target=Self.CacheIndexThread, args=(Index,), daemon=True).start()
+            File = Self.UseFiles[Index]
 
-            def CacheIndexThread(Self, Index):
-                if Index == 0:
-                    if Self.Shuffle:
-                        Self.UseFiles = random.sample(Self.Files, len(Self.Files))
-                    else:
-                        Self.UseFiles = Self.Files
+            Image = cv2.imread(File, cv2.IMREAD_COLOR_RGB)
+            Image = cv2.resize(Image, (ImageWidth, ImageHeight))
+            Image = Image / 255.0
+            Image = Self.Transform(Image)
+            Image = torch.as_tensor(Image, dtype=Self.DType, device=Self.Device)
 
-                File = Self.UseFiles[Index]
+            Class = Classes[os.path.basename(os.path.dirname(File))]
+            Label = int(Class)
+            Label = torch.as_tensor(Label, device=Self.Device)
 
-                Img = Image.open(File).convert("RGB")
-                Img = np.array(Img)
-                Img = cv2.resize(Img, (ImageWidth, ImageHeight))
-                Img = Img / 255.0
-                Img = Self.Transform(Img)
-                Img = torch.as_tensor(Img, dtype=torch.float32)
+            Self.Cache[str(Index)]["Image"] = Image
+            Self.Cache[str(Index)]["Label"] = Label
+            Self.Cache[str(Index)]["FullyCached"] = True
 
-                Class = Classes[os.path.basename(os.path.dirname(File))]
-                Label = [0] * ClassCount
-                Label[int(Class)] = 1
-                Label = torch.as_tensor(Label, dtype=torch.float32)
+        def ClearIndex(Self, Index):
+            if str(Index) in Self.Cache:
+                del Self.Cache[str(Index)]
 
-                Self.Cache[str(Index)]["Image"] = Img
-                Self.Cache[str(Index)]["Label"] = Label
-                Self.Cache[str(Index)]["FullyCached"] = True
+        def GetIndex(Self, Index):
+            if str(Index) not in Self.Cache:
+                Self.CacheIndex(Index)
+                for i in range(Self.BatchPreloadCount * Self.BatchSize):
+                    Self.CacheIndex(Index + 1 + i)
+            Self.CacheIndex(Index + Self.BatchPreloadCount * Self.BatchSize)
+            if Self.LastUsedIndex != None:
+                Self.ClearIndex(Self.LastUsedIndex)
+            while Self.Cache[str(Index)]["FullyCached"] == False:
+                time.sleep(0.0001)
+            Self.LastUsedIndex = Index
+            return Self.Cache[str(Index)]["Image"], Self.Cache[str(Index)]["Label"]
 
-            def ClearIndex(Self, Index):
-                if str(Index) in Self.Cache:
-                    del Self.Cache[str(Index)]
+        def __getitem__(Self, Index):
+            return Self.GetIndex(Index)
 
-            def GetIndex(Self, Index):
-                if str(Index) not in Self.Cache:
-                    Self.CacheIndex(Index)
-                    for i in range(Self.BatchPreloadCount * Self.BatchSize):
-                        Self.CacheIndex(Index + 1 + i)
-                Self.CacheIndex(Index + Self.BatchPreloadCount * Self.BatchSize)
-                if Self.LastUsedIndex != None:
-                    Self.ClearIndex(Self.LastUsedIndex)
-                while Self.Cache[str(Index)]["FullyCached"] == False:
-                    time.sleep(0.0001)
-                Self.LastUsedIndex = Index
-                return Self.Cache[str(Index)]["Image"], Self.Cache[str(Index)]["Label"]
+    TrainingDataset = CustomDataset(TrainingFiles, TrainingTransform, Device, torch.bfloat16, Shuffle, BatchSize, 3)
+    ValidationDataset = CustomDataset(ValidationFiles, ValidationTransform, Device, torch.bfloat16, Shuffle, BatchSize, 3)
 
-            def __getitem__(Self, Index):
-                return Self.GetIndex(Index)
+    TrainingDataloader = DataLoader(TrainingDataset, batch_size=BatchSize, shuffle=False, num_workers=0, pin_memory=False, drop_last=DropLast)
+    ValidationDataloader = DataLoader(ValidationDataset, batch_size=BatchSize, shuffle=False, num_workers=0, pin_memory=False, drop_last=DropLast)
 
-        TrainingDataset = CustomDataset(TrainingFiles, TrainingTransform, Shuffle, BatchSize, 2)
-        ValidationDataset = CustomDataset(ValidationFiles, ValidationTransform, Shuffle, BatchSize, 2)
-
-        TrainingDataloader = DataLoader(TrainingDataset, batch_size=BatchSize, shuffle=False, num_workers=0, pin_memory=PinMemory, drop_last=DropLast)
-        ValidationDataloader = DataLoader(ValidationDataset, batch_size=BatchSize, shuffle=False, num_workers=0, pin_memory=PinMemory, drop_last=DropLast)
-    else:
-        class CustomDataset(Dataset):
-            def __init__(self, Files=None, Transform=None):
-                self.Files = Files
-                self.Transform = Transform
-
-            def __len__(self):
-                return len(self.Files)
-
-            def __getitem__(self, Index):
-                File = self.Files[Index]
-                Img = Image.open(File).convert("RGB")
-                Img = np.array(Img)
-                Img = cv2.resize(Img, (ImageWidth, ImageHeight))
-                Img = Img / 255.0
-
-                Class = Classes[os.path.basename(os.path.dirname(File))]
-                Label = [0] * ClassCount
-                Label[int(Class)] = 1
-
-                Img = np.array(Img, dtype=np.float32)
-                Img = self.Transform(Img)
-                return Img, torch.as_tensor(Label, dtype=torch.float32)
-
-        TrainingDataset = CustomDataset(TrainingFiles, Transform=TrainingTransform)
-        ValidationDataset = CustomDataset(ValidationFiles, Transform=ValidationTransform)
-
-        TrainingDataloader = DataLoader(TrainingDataset, batch_size=BatchSize, shuffle=Shuffle, num_workers=NumWorkers, pin_memory=PinMemory, drop_last=DropLast)
-        ValidationDataloader = DataLoader(ValidationDataset, batch_size=BatchSize, shuffle=Shuffle, num_workers=NumWorkers, pin_memory=PinMemory, drop_last=DropLast)
-
-    Scaler = GradScaler(device=str(Device))
     Criterion = nn.CrossEntropyLoss()
     Optimizer = optim.Adam(Model.parameters(), lr=LearningRate)
     Scheduler = lr_scheduler.OneCycleLR(Optimizer, max_lr=MaxLearningRate, steps_per_epoch=len(TrainingDataloader), epochs=Epochs)
@@ -362,7 +328,6 @@ def main():
 
         Model.load_state_dict(Checkpoint["Model#StateDict"])
         BestModel.load_state_dict(Checkpoint["BestModel#StateDict"])
-        Scaler.load_state_dict(Checkpoint["Scaler#StateDict"])
         Optimizer.load_state_dict(Checkpoint["Optimizer#StateDict"])
         Scheduler.load_state_dict(Checkpoint["Scheduler#StateDict"])
         TrainingEpoch = Checkpoint["Model#Epoch"]
@@ -459,15 +424,11 @@ def main():
         Model.train()
         RunningTrainingLoss = 0.0
         for i, (Images, Labels) in enumerate(TrainingDataloader, 0):
-            Images = Images.to(Device, non_blocking=True)
-            Labels = Labels.to(Device, non_blocking=True)
             Optimizer.zero_grad()
-            with autocast(device_type=str(Device)):
-                Outputs = Model(Images)
-                Loss = Criterion(Outputs, Labels)
-            Scaler.scale(Loss).backward()
-            Scaler.step(Optimizer)
-            Scaler.update()
+            Outputs = Model(Images)
+            Loss = Criterion(Outputs, Labels)
+            Loss.backward()
+            Optimizer.step()
             Scheduler.step()
             RunningTrainingLoss += Loss.item()
             Step += 1
@@ -477,10 +438,8 @@ def main():
         EpochValidationStartTime = time.perf_counter()
         Model.eval()
         RunningValidationLoss = 0.0
-        with torch.no_grad(), autocast(device_type=str(Device)):
+        with torch.no_grad():
             for i, (Images, Labels) in enumerate(ValidationDataloader, 0):
-                Images = Images.to(Device, non_blocking=True)
-                Labels = Labels.to(Device, non_blocking=True)
                 Outputs = Model(Images)
                 Loss = Criterion(Outputs, Labels)
                 RunningValidationLoss += Loss.item()
@@ -510,7 +469,6 @@ def main():
         Checkpoint = {
             "Model#StateDict": Model.state_dict(),
             "BestModel#StateDict": BestModel.state_dict(),
-            "Scaler#StateDict": Scaler.state_dict(),
             "Optimizer#StateDict": Optimizer.state_dict(),
             "Scheduler#StateDict": Scheduler.state_dict(),
             "Model#Epoch": Epoch,
@@ -577,7 +535,6 @@ def main():
                 f"ColorChannels#{ColorChannels}",
                 f"LearningRate#{LearningRate}",
                 f"MaxLearningRate#{MaxLearningRate}",
-                f"NumberOfWorkers#{NumWorkers}",
                 f"Dropout#{Dropout}",
                 f"Patience#{Patience}",
                 f"Shuffle#{Shuffle}",
@@ -629,7 +586,6 @@ def main():
                 f"ColorChannels#{ColorChannels}",
                 f"LearningRate#{LearningRate}",
                 f"MaxLearningRate#{MaxLearningRate}",
-                f"NumberOfWorkers#{NumWorkers}",
                 f"Dropout#{Dropout}",
                 f"Patience#{Patience}",
                 f"Shuffle#{Shuffle}",
